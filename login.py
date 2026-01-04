@@ -7,7 +7,7 @@ LastEditTime: 2025-01-04 13:34:30
 Discription: file content
 """
 
-import websocket
+import subprocess
 import threading
 import requests
 import logging
@@ -20,6 +20,9 @@ import json
 from typing import Any, Optional, Dict, Callable
 from watch import load_watch_list
 from utils.helpers import console
+import os
+
+os.environ["NO_PROXY"] = "xk.xmu.edu.cn"
 
 
 class XMULogin:
@@ -221,90 +224,138 @@ class XMUWebSocketClient:
         self,
         url: str,
         cookie: str,
-        heartbeat_interval: int = 30,
-        on_message_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+        heartbeat_interval: int = 10,
+        on_message_callback: Optional[Callable[[Any], None]] = None,
     ) -> None:
-        """
-        :param url: WebSocket 目标地址
-        :param cookie: 完整的 Cookie 字符串
-        :param heartbeat_interval: 自定义心跳间隔（秒）
-        :param on_message_callback: 业务消息回调
-        """
         self.url: str = url
         self.cookie: str = cookie
         self.heartbeat_interval: int = heartbeat_interval
         self.on_message_callback: Optional[Callable[[Any], None]] = on_message_callback
 
-        self.ws: Optional[websocket.WebSocketApp] = None
+        self.process: Optional[subprocess.Popen[Any]] = None
         self.is_running: bool = False
+        self._read_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
 
-    def _get_headers(self) -> list[str]:
-        return [
+    def _get_websocat_cmd(self) -> list[str]:
+        """构建 websocat 命令"""
+        # 注意：--insecure 对应之前的 sslopt={"cert_reqs": ssl.CERT_NONE}
+        cmd = [
+            "websocat",
+            self.url,
+            "--insecure",
+            "--text",
+            "-H",
             "Origin: https://xk.xmu.edu.cn",
+            "-H",
             f"Cookie: {self.cookie}",
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "-H",
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         ]
-
-    def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        console.print(f"[green][WS] 连接已建立[/green]")
-        self.is_running = True
-        # 开启自定义心跳线程
-        self._heartbeat_thread = threading.Thread(
-            target=self._send_custom_heartbeat, daemon=True
-        )
-        self._heartbeat_thread.start()
-
-    def _on_message(self, ws: websocket.WebSocketApp, message: Any) -> None:
-        try:
-            # 解析 JSON 响应
-            data = json.loads(message)
-            # 识别并拦截心跳返回包
-            if data.get("data") == "heart" and data.get("code") == 200:
-                console.print("[green][WS] 心跳同步成功: pong[/green]")  # 调试用
-                return
-        except (json.JSONDecodeError, TypeError):
-            # 如果不是 JSON，按原始数据处理
-            data = message
-
-        # 传递给业务回调
-        if self.on_message_callback:
-            self.on_message_callback(data)
-
-    def _send_custom_heartbeat(self) -> None:
-        """自定义心跳线程逻辑"""
-        console.print(
-            f"[green][WS] 自定义心跳线程启动 (间隔: {self.heartbeat_interval}s)[/green]"
-        )
-        while self.is_running:
-            if self.ws and self.ws.sock and self.ws.sock.connected:
-                try:
-                    # 发送自定义心跳字符串
-                    self.ws.send("hi")
-                    console.print("[green][WS] 发送心跳: hi[/green]")  # 调试用
-                except Exception as e:
-                    console.print(f"[red][WS] 心跳发送失败: {e}[/red]")
-            time.sleep(self.heartbeat_interval)
-
-    def _on_error(self, ws: websocket.WebSocketApp, error: Exception) -> None:
-        console.print(f"[red][WS] 错误: {error}[/red]")
-
-    def _on_close(self, ws: websocket.WebSocketApp, status: int, msg: str) -> None:
-        console.print(f"[red][WS] 连接关闭: {status} - {msg}[/red]")
-        self.is_running = False
+        return cmd
 
     def connect(self) -> None:
-        """启动客户端"""
-        self.ws = websocket.WebSocketApp(
-            self.url,
-            header=self._get_headers(),  # type:ignore
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
+        """启动 websocat 驱动"""
+        cmd = self._get_websocat_cmd()
+        console.print(f'[blue][WS] 启动 websocat 驱动连接到 "{self.url}"[/blue]')
 
-        # 运行 WebSocket 的 IO 循环
-        t = threading.Thread(target=self.ws.run_forever)  # type:ignore
-        t.daemon = True
-        t.start()
+        try:
+            # 启动进程
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # 行缓冲
+                encoding="utf-8",
+            )
+            self.is_running = True
+
+            # 启动读取线程（模拟 on_message）
+            self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._read_thread.start()
+
+            # 启动心跳线程（模拟 on_open 后的逻辑）
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, daemon=True
+            )
+            self._heartbeat_thread.start()
+
+            console.print(
+                f"[green][WS] websocat 进程已启动 (PID: {self.process.pid})[/green]"
+            )
+
+        except FileNotFoundError:
+            console.print(
+                "[red][WS] 错误: 未在系统中找到 websocat，请确保已安装并加入环境变量[/red]"
+            )
+        except Exception as e:
+            console.print(f"[red][WS] 启动失败: {e}[/red]")
+
+    def _read_loop(self) -> None:
+        """读取 websocat 输出并触发回调"""
+        while self.is_running and self.process and self.process.stdout:
+            line = self.process.stdout.readline()
+            if not line:
+                break
+
+            clean_line = line.strip()
+            if not clean_line:
+                continue
+
+            # 模拟原有的 _on_message 逻辑
+            try:
+                data = json.loads(clean_line)
+                if data.get("data") == "heart" and data.get("code") == 200:
+                    console.print("[green][WS] 心跳同步成功: pong[/green]")
+                    continue
+            except:
+                data = clean_line
+
+            if self.on_message_callback:
+                self.on_message_callback(data)
+
+        self.is_running = False
+        console.print("[red][WS] websocat 连接已断开[/red]")
+
+    def _heartbeat_loop(self) -> None:
+        """自定义心跳逻辑"""
+        # 给握手留一点缓冲时间
+        time.sleep(2)
+        while self.is_running:
+            self.send("hi")
+            time.sleep(self.heartbeat_interval)
+
+    def send(self, msg: str) -> None:
+        """向服务器发送消息"""
+        if self.is_running and self.process and self.process.stdin:
+            try:
+                self.process.stdin.write(f"{msg}\n")
+                self.process.stdin.flush()
+                # console.print(f"[dim][WS] 发送: {msg}[/dim]")
+            except Exception as e:
+                console.print(f"[red][WS] 发送失败: {e}[/red]")
+
+    def close(self) -> None:
+        """关闭连接"""
+        self.is_running = False
+        if self.process:
+            self.process.terminate()
+            console.print("[yellow][WS] websocat 进程已终止[/yellow]")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    xmu_login = XMULogin()
+    success = xmu_login.login()
+    if success:
+        logging.info("登录流程完成，进入主程序")
+        time.sleep(10000)
+    else:
+        logging.error("登录失败，退出程序")
