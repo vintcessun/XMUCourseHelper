@@ -190,13 +190,13 @@ class XMULogin:
                     self.batch_id = ""
 
                 def callback(msg: dict[str, Any]) -> None:
-                    logging.info(f"[WS消息] {msg}")
+                    console.print(f"[green][WS消息] {msg}[/green]")
                     if msg.get("code") == 200:
                         clazz_id = msg.get("data", {}).get("clazzId", "")
                         for course in self.watch_list[:]:
                             if course["JXBID"] == clazz_id:
-                                logging.info(
-                                    f"选课成功: {course['KCM']} ({course['JXBID']})"
+                                console.print(
+                                    f"[green]选课成功: {course['KCM']} ({course['JXBID']})[/green]"
                                 )
                                 self.watch_list.remove(course)
 
